@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+Model merging script for combining multiple Qwen3 models.
+
+This script merges two or more compatible models using weighted linear
+interpolation. The merged model will have different SHA hashes and may
+show improved performance due to ensemble effects.
+
+Usage (two models, equal mix):
+    python merge_models.py --models ./model_a ./model_b --output ./merged
+
+Usage (three models with custom weights):
+    python merge_models.py --models ./model_a ./model_b ./model_c \\
+        --weights 0.5 0.3 0.2 --output ./merged
+
+Usage (four models, equal mix, re-shard):
+    python merge_models.py --models ./m1 ./m2 ./m3 ./m4 \\
+        --output ./merged --max-shard-size 5GB
+
+Notes:
+  - --weights are automatically normalized to sum to 1.0.
+  - If --weights is omitted, all models are weighted equally (1/N each).
+  - The number of --weights values must equal the number of --models.
+  - All models must share the same architecture, hidden_size, and layer count.
+  - Config and shard layout are taken from the first model.
+  - tokenizer_config.json is taken from the last model (may carry chat_template).
+"""
+
+import os
+import json
+import argparse
+import torch
+from pathlib import Path
+from typing import List
+from safetensors.torch import load_file, save_file
+from transformers import AutoConfig
+from tqdm import tqdm
+import shutil
+
+
+def load_model_weights(model_dir: Path):
+    """Load all weights from a model directory."""
+    weights = {}
+    index_file = model_dir / "model.safetensors.index.json"
+
+    if not index_file.exists():
+        raise FileNotFoundError(f"Index file not found: {index_file}")
+
+    with open(index_file, 'r') as f:
+        index = json.load(f)
+
+    weight_map = index.get("weight_map", {})
+    shard_files = set(weight_map.values())
+
+    print(f"  Loading {len(shard_files)} shard file(s)...")
+    for shard_file in shard_files:
+        shard_path = model_dir / shard_file
+        if not shard_path.exists():
+            raise FileNotFoundError(f"Shard file not found: {shard_path}")
+        shard_weights = load_file(str(shard_path))
+        weights.update(shard_weights)
+
+    return weights, index
+
+
+def merge_weights(all_weights: List[dict], model_weights: List[float]) -> dict:
+    """
+    Merge N weight dictionaries using a weighted linear combination.
+
+    Args:
+        all_weights:   List of weight dicts, one per model.
+        model_weights: Normalized scalar weight for each model (must sum to 1.0).
+
+    Returns:
+        Merged weights dictionary.
+    """
+    assert len(all_weights) == len(model_weights), \
+        "Number of weight dicts must match number of scalar weights"
+    assert abs(sum(model_weights) - 1.0) < 1e-6, \
+        f"model_weights must sum to 1.0, got {sum(model_weights):.6f}"
+
+    # Collect the union of all tensor keys
+    all_keys: set = set()
+    for w in all_weights:
+        all_keys |= w.keys()
+
+    weights_str = " + ".join(f"{w:.4f}*m{i+1}" for i, w in enumerate(model_weights))
+    print(f"Merging {len(all_keys)} weight tensors: {weights_str}")
+
+    merged = {}
+    for key in tqdm(all_keys, desc="Merging weights"):
+        # Find the first model that has this key (determines dtype & shape)
+        ref_idx = next(i for i, w in enumerate(all_weights) if key in w)
+        ref_tensor = all_weights[ref_idx][key]
+        original_dtype = ref_tensor.dtype
+
+        # Accumulate weighted sum
+        acc = torch.zeros_like(ref_tensor, dtype=torch.float32)
+        for tensors, scalar in zip(all_weights, model_weights):
+            if key in tensors:
+                t = tensors[key]
+                if t.shape != ref_tensor.shape:
+                    raise ValueError(
+                        f"Shape mismatch for '{key}': "
+                        f"model{ref_idx+1} has {ref_tensor.shape}, "
+                        f"another model has {t.shape}"
+                    )
+                acc += scalar * t.float()
+            # Keys absent in a model are simply skipped (contribute 0 to the sum)
+
+        # Restore the original dtype to avoid bloating the checkpoint
+        merged[key] = acc.to(original_dtype)
+
+    return merged
+
+
+def _parse_shard_size(size_str: str) -> int:
+    """Parse a human-readable size string into bytes. Accepts e.g. '5GB', '500MB', '5G', '500M'."""
+    import re
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(T|TB|G|GB|M|MB|K|KB)', size_str.strip(), re.IGNORECASE)
+    if not m:
+        raise ValueError(
+            f"Invalid --max-shard-size value: '{size_str}'. "
+            "Expected a number followed by a unit, e.g. '5GB', '500MB', '2TB'."
+        )
+    value, unit = float(m.group(1)), m.group(2).upper().rstrip('B')
+    multipliers = {"T": 1024**4, "G": 1024**3, "M": 1024**2, "K": 1024}
+    return int(value * multipliers[unit])
+
+
+def _save_shards_by_size(merged_weights: dict, output_dir: Path, max_shard_size: str) -> dict:
+    """
+    Shard weights by size limit and return the resulting weight_map.
+    Used only when --max-shard-size is explicitly provided.
+    """
+    max_size_bytes = _parse_shard_size(max_shard_size)
+
+    current_shard_size = 0
+    shard_num = 1
+    current_shard: dict = {}
+    temp_weight_map: dict = {}
+
+    print(f"Saving merged weights (max shard size: {max_shard_size})...")
+
+    for key in tqdm(sorted(merged_weights.keys()), desc="Saving shards"):
+        tensor = merged_weights[key]
+        tensor_size = tensor.numel() * tensor.element_size()
+
+        if current_shard_size + tensor_size > max_size_bytes and current_shard:
+            shard_filename = f"model-{shard_num:05d}-of-TOTAL.safetensors"
+            save_file(current_shard, str(output_dir / shard_filename))
+            for k in current_shard:
+                temp_weight_map[k] = shard_filename
+            current_shard = {}
+            current_shard_size = 0
+            shard_num += 1
+
+        current_shard[key] = tensor
+        current_shard_size += tensor_size
+
+    if current_shard:
+        shard_filename = f"model-{shard_num:05d}-of-TOTAL.safetensors"
+        save_file(current_shard, str(output_dir / shard_filename))
+        for k in current_shard:
+            temp_weight_map[k] = shard_filename
+
+    # Rename to final filenames now that total shard count is known
+    total_shards = shard_num
+    seen: dict = {}
+    weight_map: dict = {}
+    for key, old_filename in temp_weight_map.items():
+        if old_filename not in seen:
+            new_filename = f"model-{len(seen)+1:05d}-of-{total_shards:05d}.safetensors"
+            (output_dir / old_filename).rename(output_dir / new_filename)
+            seen[old_filename] = new_filename
+        weight_map[key] = seen[old_filename]
+
+    return weight_map
+
+
+def save_merged_model(
+    merged_weights: dict,
+    config: dict,
+    output_dir: Path,
+    model_dirs: List[Path],
+    index_ref: dict,
+    max_shard_size: str = None,
+):
+    """
+    Save merged model.
+
+    Config and shard layout are taken from model_dirs[0] (the first model).
+    tokenizer_config.json is taken from the last model (highest index), which
+    often carries the most up-to-date chat_template. All other tokenizer files
+    fall back to the first model.
+
+    Args:
+        merged_weights: Merged weights dictionary.
+        config:         Model configuration (from first model, already a dict).
+        output_dir:     Output directory.
+        model_dirs:     Ordered list of all source model directories.
+        index_ref:      model.safetensors.index.json from the first model.
+        max_shard_size: Optional size limit (e.g. "5GB"). When set, re-shards by
+                        size rather than preserving the original layout.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save config
+    config_path = output_dir / "config.json"
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+
+    # Copy tokenizer files.
+    # tokenizer_config.json: try models in reverse order (last model first)
+    # so the most recent chat_template wins, then fall back to first model.
+    # All other files come from the first model.
+    tokenizer_files = [
+        "tokenizer.json", "vocab.json", "merges.txt",
+        "tokenizer_config.json", "special_tokens_map.json",
+        "added_tokens.json", "generation_config.json",
+        "chat_template.jinja",
+    ]
+    first_model_dir = model_dirs[0]
+    last_model_dir  = model_dirs[-1]
+
+    for tokenizer_file in tokenizer_files:
+        if tokenizer_file == "tokenizer_config.json":
+            src = next(
+                (d / tokenizer_file for d in reversed(model_dirs)
+                 if (d / tokenizer_file).exists()),
+                first_model_dir / tokenizer_file,
+            )
+        else:
+            src = first_model_dir / tokenizer_file
+        if src.exists():
+            shutil.copy2(src, output_dir / tokenizer_file)
+
+    if max_shard_size is not None:
+        weight_map = _save_shards_by_size(merged_weights, output_dir, max_shard_size)
+        total_shards = len({v for v in weight_map.values()})
+        print(f"Saved merged weights across {total_shards} size-based shard(s).")
+    else:
+        # Preserve original shard layout from the first model
+        weight_map = index_ref["weight_map"]
+        shard_to_keys: dict = {}
+        for key, shard_filename in weight_map.items():
+            shard_to_keys.setdefault(shard_filename, []).append(key)
+
+        print(f"Saving merged weights across {len(shard_to_keys)} original shard(s)...")
+
+        for shard_filename, keys in tqdm(shard_to_keys.items(), desc="Saving shards"):
+            shard_tensors = {k: merged_weights[k] for k in keys}
+            save_file(shard_tensors, str(output_dir / shard_filename))
+
+        total_shards = len(shard_to_keys)
+
+    # Save index file
+    index_data = {
+        "metadata": {
+            "total_size": sum(
+                (output_dir / f).stat().st_size
+                for f in os.listdir(output_dir)
+                if f.endswith(".safetensors")
+            )
+        },
+        "weight_map": weight_map,
+    }
+    index_path = output_dir / "model.safetensors.index.json"
+    with open(index_path, 'w') as f:
+        json.dump(index_data, f, indent=2)
+
+    print(f"\nMerged model saved to: {output_dir}")
+    print(f"Total shards:          {total_shards}")
+    print(f"Total parameters:      {sum(t.numel() for t in merged_weights.values()):,}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Merge two or more compatible Qwen3 models via weighted linear interpolation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Two models, equal mix (same as --weights 0.5 0.5)
+  python merge_models.py --models ./model_a ./model_b --output ./merged
+
+  # Three models with explicit weights (auto-normalized)
+  python merge_models.py --models ./m1 ./m2 ./m3 --weights 0.5 0.3 0.2 --output ./merged
+
+  # Four models, equal mix, re-shard to 5 GB per file
+  python merge_models.py --models ./m1 ./m2 ./m3 ./m4 --output ./merged --max-shard-size 5GB
+        """,
+    )
+    parser.add_argument(
+        "--models",
+        type=str,
+        nargs="+",
+        required=True,
+        metavar="MODEL_DIR",
+        help="Two or more model directories to merge (order matters for config/tokenizer source)",
+    )
+    parser.add_argument(
+        "--weights",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="W",
+        help=(
+            "Scalar weight for each model (same count as --models). "
+            "Values are normalized to sum to 1.0. "
+            "Defaults to equal weights when omitted."
+        ),
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="./merged_model",
+        help="Output directory for the merged model (default: ./merged_model)",
+    )
+    parser.add_argument(
+        "--max-shard-size",
+        type=str,
+        default=None,
+        help="Re-shard by size limit instead of preserving original layout (e.g. '5GB', '10GB')",
+    )
+
+    args = parser.parse_args()
+
+    model_dirs = [Path(p) for p in args.models]
+    output_dir = Path(args.output)
+    n = len(model_dirs)
+
+    if n < 2:
+        parser.error("--models requires at least two model directories.")
+
+    # Validate / build normalized weights
+    if args.weights is None:
+        raw_weights = [1.0 / n] * n
+    else:
+        if len(args.weights) != n:
+            parser.error(
+                f"--weights requires exactly {n} value(s) to match --models, "
+                f"but got {len(args.weights)}."
+            )
+        if any(w < 0 for w in args.weights):
+            parser.error("All --weights values must be non-negative.")
+        total = sum(args.weights)
+        if total <= 0:
+            parser.error("The sum of --weights must be positive.")
+        raw_weights = [w / total for w in args.weights]
+
+    # Verify all model directories exist
+    for i, d in enumerate(model_dirs):
+        if not d.exists():
+            raise FileNotFoundError(f"Model directory not found (model {i+1}): {d}")
+
+    # ── Load and verify configs ────────────────────────────────────────────────
+    print(f"Loading configurations for {n} model(s)...")
+    configs = [AutoConfig.from_pretrained(str(d)) for d in model_dirs]
+    ref_cfg = configs[0]
+
+    for i, cfg in enumerate(configs[1:], start=2):
+        if cfg.architectures != ref_cfg.architectures:
+            raise ValueError(
+                f"Architecture mismatch: model1={ref_cfg.architectures}, "
+                f"model{i}={cfg.architectures}"
+            )
+        if cfg.hidden_size != ref_cfg.hidden_size:
+            raise ValueError(
+                f"Hidden size mismatch: model1={ref_cfg.hidden_size}, "
+                f"model{i}={cfg.hidden_size}"
+            )
+        if cfg.num_hidden_layers != ref_cfg.num_hidden_layers:
+            raise ValueError(
+                f"Layer count mismatch: model1={ref_cfg.num_hidden_layers}, "
+                f"model{i}={cfg.num_hidden_layers}"
+            )
+
+    print(f"✓ All {n} models are architecture-compatible")
+
+    # Use first model's config as base
+    merged_config = ref_cfg.to_dict()
+    merged_config["torch_dtype"] = "bfloat16"
+    merged_config.pop("_name_or_path", None)
+
+    # ── Load weights ──────────────────────────────────────────────────────────
+    print(f"\nLoading weights for {n} model(s)...")
+    all_weights = []
+    index_ref = None
+    for i, (d, w) in enumerate(zip(model_dirs, raw_weights)):
+        print(f"  [{i+1}/{n}] {d}  (weight={w:.4f})")
+        tensors, index = load_model_weights(d)
+        all_weights.append(tensors)
+        if i == 0:
+            index_ref = index
+        print(f"         → {len(tensors)} tensors loaded")
+
+    # ── Merge ─────────────────────────────────────────────────────────────────
+    weight_summary = ", ".join(f"m{i+1}×{w:.4f}" for i, w in enumerate(raw_weights))
+    print(f"\nMerging {n} models: {weight_summary}")
+    merged_weights = merge_weights(all_weights, raw_weights)
+
+    # ── Save ──────────────────────────────────────────────────────────────────
+    print(f"\nSaving merged model to: {output_dir}")
+    save_merged_model(
+        merged_weights,
+        merged_config,
+        output_dir,
+        model_dirs,
+        index_ref,
+        max_shard_size=args.max_shard_size,
+    )
+
+    print("\n✓ Model merging complete!")
+    print("\nNext steps:")
+    print(f"  1. Test:   python scripts/test_base_model.py --model_path {output_dir}")
+    print(f"  2. Upload: python scripts/upload_to_huggingface.py --model_path {output_dir}")
+    print(f"  3. Deploy: af chutes_push --repo <your-repo> --revision <sha>")
+
+
+if __name__ == "__main__":
+    main()

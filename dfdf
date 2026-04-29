@@ -1,0 +1,12 @@
+1. Please install mergekit
+
+uv pip install mergekit
+
+2. generate model using this command
+
+mergekit-yaml dare_ties_config.yaml ./merged_model\
+  --copy-tokenizer \
+  --allow-crimes \
+  --out-shard-size 5B \
+  --lazy-unpickle \
+  --trust-remote-code

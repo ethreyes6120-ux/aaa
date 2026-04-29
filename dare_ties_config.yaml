@@ -1,0 +1,23 @@
+# dare_ties_config.yaml
+
+merge_method: dare_ties
+
+# Base model (used as reference for delta computation)
+base_model: ./model_15
+
+models:
+  - model: ./model_9
+    parameters:
+      weight: 0.7       # Contribution of Model A
+      density: 0.85      # Top-k trim: keep 70% of deltas
+
+  - model: ./model_2
+    parameters:
+      weight: 0.3       # Contribution of Model A
+      density: 0.85      # Top-k trim: keep 70% of deltas
+
+parameters:
+  normalize: true        # Normalize weights so they sum to 1.0
+  int8_mask: true        # Use int8 for sign mask (saves memory)
+
+dtype: bfloat16          # Output dtype — keep BF16 to match source models

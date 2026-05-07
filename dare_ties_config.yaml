@@ -3,18 +3,23 @@
 merge_method: dare_ties
 
 # Base model (used as reference for delta computation)
-base_model: ./model_15
+base_model: ./Qwen3-32B
 
 models:
   - model: ./model_9
     parameters:
-      weight: 0.7       # Contribution of Model A
-      density: 0.85      # Top-k trim: keep 70% of deltas
+      weight: 0.5       # Contribution of Model A
+      density: 1      # Don't change
 
   - model: ./model_2
     parameters:
-      weight: 0.3       # Contribution of Model A
-      density: 0.85      # Top-k trim: keep 70% of deltas
+      weight: 0.3       # Contribution of Model B
+      density: 1      # Don't change
+
+  - model: ./model_3
+    parameters:
+      weight: 0.2       # Contribution of Model C
+      density: 1      # Don't change
 
 parameters:
   normalize: true        # Normalize weights so they sum to 1.0
